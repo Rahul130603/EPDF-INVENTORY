@@ -8,7 +8,12 @@ $checksums = @($release.assets | Where-Object name -eq 'SHA256SUMS.txt')
 if ($asset.Count -ne 1 -or $checksums.Count -ne 1) {
     throw 'The latest release does not contain the portable EXE and its checksum. Download them from GitHub Releases.'
 }
-$checksumText = (Invoke-WebRequest -Uri $checksums[0].browser_download_url -Headers $headers -UseBasicParsing).Content
+$checksumContent = (Invoke-WebRequest -Uri $checksums[0].browser_download_url -Headers $headers -UseBasicParsing).Content
+$checksumText = if ($checksumContent -is [byte[]]) {
+    [Text.Encoding]::UTF8.GetString($checksumContent)
+} else {
+    [string]$checksumContent
+}
 $checksumLine = @($checksumText -split '\r?\n' | Where-Object { $_ -match '^([a-fA-F0-9]{64})\s+\*?BookScannerPDFExport\.exe$' })
 if ($checksumLine.Count -ne 1) { throw 'The release checksum is invalid.' }
 $expectedHash = ($checksumLine[0] -split '\s+')[0]
