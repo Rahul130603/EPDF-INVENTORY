@@ -1,0 +1,17 @@
+.venv/
+.tmp/
+__pycache__/
+*.pyc
+models/*
+!models/sources.json
+reports/
+.inventory-cache.json
+dist/
+build/
+*.spec
+*.xlsx
+*.audit.json
+*.cache.json
+.env
+.env.*
+!.env.example
