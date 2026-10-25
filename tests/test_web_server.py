@@ -135,7 +135,8 @@ class WebDashboardTests(unittest.TestCase):
                 self.assertTrue(state['running'])
                 self.assertEqual(len(state['rows']),1)
                 self.assertEqual(state['rows'][0]['title'],'Book A')
-                self.assertIsNone(state['report'])
+                self.assertTrue(state['report'].endswith('live.partial.xlsx'))
+                self.assertTrue(Path(state['report']).is_file())
                 self.assertEqual(state['done'],1)
                 self.assertEqual(state['total'],2)
             finally:
@@ -184,6 +185,51 @@ class WebDashboardTests(unittest.TestCase):
         self.assertEqual({r['title'] for r in state['rows']},{'Parallel book A','Parallel book B'})
         audit=json.loads((self.folder/'parallel.audit.json').read_text(encoding='utf-8'))
         self.assertEqual(audit['options']['workers'],4)
+
+    def test_dashboard_survives_a_native_pdf_worker_crash(self):
+        import pymupdf
+        from test_crash_recovery import crash_one_book
+        for name in ('A_good','B_crash','C_good'):
+            with pymupdf.open() as doc:
+                doc.new_page().insert_text((50,80),'Title: A book about history')
+                doc.save(self.folder/f'{name}.pdf')
+        with patch('inventory.engine.isolated_book_worker',crash_one_book):
+            self.assertEqual(self.request('/api/scan',{'folder':str(self.folder),
+                'output':str(self.folder/'recovered.xlsx'),'ocr':False,
+                'online_titles':False,'workers':1})[0],202)
+            deadline=time.monotonic()+25
+            while self.server.dashboard.snapshot()['running'] and time.monotonic()<deadline:
+                self.assertEqual(self.request('/api/state')[0],200)
+                time.sleep(.1)
+        state=self.server.dashboard.snapshot()
+        self.assertEqual(state['status'],'Scan complete',state)
+        self.assertIsNone(state['error'])
+        self.assertEqual(len(state['rows']),3)
+        self.assertEqual(sum(bool(r.get('worker_error')) for r in state['rows']),1)
+        self.assertEqual(self.request('/api/report')[0],200)
+
+    def test_timer_and_http_remain_responsive_during_stalled_native_call(self):
+        import pymupdf
+        from test_crash_recovery import stalled_worker
+        with pymupdf.open() as doc:
+            doc.new_page()
+            doc.save(self.folder/'Stalled.pdf')
+        with patch('inventory.engine.isolated_book_worker',stalled_worker), \
+             patch('inventory.engine.WORKER_STALL_SECONDS',3):
+            self.assertEqual(self.request('/api/scan',{'folder':str(self.folder),
+                'output':str(self.folder/'timeout.xlsx'),'ocr':False,
+                'online_titles':False,'workers':1})[0],202)
+            start=json.loads(self.request('/api/state')[1])
+            time.sleep(1.1)
+            current=json.loads(self.request('/api/state')[1])
+            self.assertTrue(current['running'])
+            self.assertGreater(current['elapsed'],start['elapsed'])
+            deadline=time.monotonic()+15
+            while self.server.dashboard.snapshot()['running'] and time.monotonic()<deadline:
+                time.sleep(.1)
+        final=self.server.dashboard.snapshot()
+        self.assertEqual(final['status'],'Scan complete')
+        self.assertIn('No page progress',final['rows'][0]['worker_error'])
 
     def test_worker_count_accepts_six_and_rejects_invalid_values(self):
         for workers in (0, 7, '6', True):

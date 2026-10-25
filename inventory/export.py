@@ -40,13 +40,13 @@ def worksheet(rows, widths):
             + f'</sheetData><autoFilter ref="A1:{last}"/></worksheet>')
 
 
-def export_workbook(path: Path, results: list[dict], cancelled=False):
+def export_workbook(path: Path, results: list[dict], cancelled=False, run_status=None):
     inventory = [HEADERS]
     review = [["INVENTORY ROW", "SOURCE FILES", "REVIEW NOTES", "LANGUAGE CONFIDENCE", "IMAGE COUNT METHOD", "EXTERNAL IMAGE FILES", "RUN STATUS"]]
     for index, result in enumerate(results, 2):
         inventory.append([result[key] for key in ("isbn", "title", "language", "book_type", "page_count", "image_count")])
         review.append([index, "\n".join(result["sources"]), "\n".join(result["notes"]), result["language_confidence"],
-                       result["image_method"], result["external_image_files"], "PARTIAL - CANCELLED" if cancelled else "COMPLETE"])
+                       result["image_method"], result["external_image_files"], run_status or ("PARTIAL - CANCELLED" if cancelled else "COMPLETE")])
     if not results:
         review.append(["", "", "No completed books", "", "", "", "PARTIAL - CANCELLED" if cancelled else "COMPLETE"])
     temporary = path.with_name(path.stem + ".tmp.xlsx")

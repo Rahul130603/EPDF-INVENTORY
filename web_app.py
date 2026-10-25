@@ -36,7 +36,7 @@ class Dashboard:
             if data['running'] and data['started']:
                 data['elapsed'] = int(time.time()-data['started'])
             return {**data, 'token': self.token, 'history': self.history, 'default_output': str(REPORT_DIR/'inventory.xlsx'),
-                    'workflow':'isbn-list-filter-v10','txt_ocr_pages':10,'online_titles':True,'live_results':True,'workers':4}
+                    'workflow':'isolated-workers-v1.1.0','txt_ocr_pages':10,'online_titles':True,'live_results':True,'workers':4}
 
     def start(self, body):
         from inventory.engine import Options, DEFAULT_WORKERS, MAX_WORKERS
@@ -83,11 +83,15 @@ class Dashboard:
         def book_complete(row):
             with self.lock:
                 self.data['rows'].append({k:v for k,v in row.items() if k != 'regions'})
+                partial = output.with_name(output.stem + '.partial.xlsx')
+                if partial.is_file():
+                    self.data['report'] = str(partial)
         try:
             rows,cancelled = run(folder,output,options,progress,self.stop,resume,on_book_complete=book_complete)
             with self.lock:
                 self.data.update(rows=[{k:v for k,v in row.items() if k != 'regions'} for row in rows],report=str(output),
-                                 status='Partial report saved' if cancelled else 'Scan complete', message=str(output))
+                                 status='Partial report saved' if cancelled else 'Scan complete',
+                                 message=(str(output) + ('; failed books are listed in Review' if any(r.get('worker_error') for r in rows) else '')))
                 self.history.insert(0,dict(id=secrets.token_hex(8),time=time.strftime('%Y-%m-%d %H:%M'),
                                           folder=str(folder),output=str(output),books=len(rows),status=self.data['status']))
                 self.history = self.history[:100]
@@ -99,6 +103,9 @@ class Dashboard:
         except Exception as exc:
             with self.lock:
                 self.data.update(status='Scan failed',message=str(exc),error=str(exc))
+                partial = output.with_name(output.stem + '.partial.xlsx')
+                if self.data['rows'] and partial.is_file():
+                    self.data.update(report=str(partial),message=str(exc) + '; completed entries saved in ' + str(partial))
         finally:
             with self.lock:
                 self.data.update(running=False,elapsed=int(time.time()-self.data['started']))

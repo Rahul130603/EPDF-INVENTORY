@@ -36,7 +36,7 @@ class ParallelTests(unittest.TestCase):
         self.assertEqual(sorted(parallel,key=lambda r:r['title']),sorted(sequential,key=lambda r:r['title']))
         self.assertEqual(len({r['sources'][0] for r in seen}),4)
         # Worker count doesn't invalidate cache or spawn processes for cached books.
-        with patch('inventory.engine.ProcessPoolExecutor',side_effect=AssertionError('Cache should be reused')):
+        with patch('inventory.engine.analyse_book',side_effect=AssertionError('Cache should be reused')):
             resumed,_=run(self.books,self.root/'parallel.xlsx',Options(ocr=False,online_titles=False,workers=1))
             self.assertEqual(len(resumed),4)
 

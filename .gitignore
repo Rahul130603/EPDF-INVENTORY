@@ -5,6 +5,7 @@ __pycache__/
 models/*
 !models/sources.json
 reports/
+outputs/
 .inventory-cache.json
 dist/
 build/

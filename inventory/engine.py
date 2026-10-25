@@ -5,8 +5,7 @@ import json
 import re
 import threading
 import multiprocessing
-from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
-from queue import Empty
+import time
 import pymupdf
 import numpy as np
 from .discovery import discover, IMAGES, Book, structured_pdf, book_part, spreadsheet_pdf
@@ -15,6 +14,8 @@ from .vision import DEFAULT_MODELS, check_models, ocr_page, picture_regions, ana
 
 DEFAULT_WORKERS = 4
 MAX_WORKERS = 6
+WORKER_STALL_SECONDS = 300
+CANCEL_GRACE_SECONDS = 5
 
 
 @dataclass
@@ -29,23 +30,65 @@ class Options:
     fast_isbn_folders: bool = False
 
 
-_worker_stop = None
-_worker_progress = None
-
-
-def initialize_worker(stop, messages):
-    global _worker_stop, _worker_progress
+def isolated_book_worker(book, options, stop, connection):
+    """Native PDF/OCR faults must never run inside the dashboard process."""
     import os
     import cv2
     os.environ['OMP_THREAD_LIMIT'] = '1'
     cv2.setNumThreads(1)
-    _worker_stop, _worker_progress = stop, messages
+    if os.name == 'nt':
+        import ctypes
+        ctypes.windll.kernel32.SetErrorMode(0x0001 | 0x0002 | 0x8000)
+    try:
+        result = analyse_book(book, options, stop.is_set,
+                              lambda message: connection.send(('progress', message)))
+        connection.send(('result', result))
+    except InterruptedError:
+        connection.send(('cancelled', None))
+    except Exception as exc:
+        connection.send(('error', f'{type(exc).__name__}: {exc}'))
+    finally:
+        connection.close()
 
 
-def process_book(index, book, options):
-    # PDF documents never cross processes; each worker opens its own files.
-    return analyse_book(book,options,_worker_stop.is_set,
-                        lambda message:_worker_progress.put((index,message)))
+def failed_book(book, reason):
+    """Keep a failed book visible without opening its unsafe source again."""
+    isbns = find_isbns('\n'.join(p.name for p in book.files))
+    if not isbns:
+        isbns = find_isbns(book.key)
+    return {'isbn': isbns[0] if isbns else 'NOT FOUND', 'title': 'NEEDS REVIEW',
+            'language': 'NEEDS REVIEW', 'book_type': 'NEEDS REVIEW',
+            'page_count': 'N/A', 'image_count': 'NEEDS REVIEW',
+            'part': next((book_part(p) for p in book.files if structured_pdf(p)), None),
+            'sources': [str(p) for p in book.files],
+            'notes': list(book.notes) + ['ERROR: Isolated book processing failed: ' + reason],
+            'language_confidence': 0, 'image_method': 'Not completed; worker failed',
+            'external_image_files': 0, 'regions': [], 'all_isbns': isbns,
+            'worker_error': reason}
+
+
+def close_worker(process, connection):
+    connection.close()
+    if process.pid is not None:
+        process.join(timeout=.2)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=2)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=2)
+        process.close()
+
+
+def worker_has_message(task):
+    if task['eof']:
+        return False
+    try:
+        return task['reader'].poll()
+    except OSError:
+        # Windows reports an abruptly closed native-worker pipe as WinError 109.
+        task['eof'] = True
+        return False
 
 
 def read_text(path: Path) -> str:
@@ -406,6 +449,7 @@ def run(root: Path, output: Path, options: Options, progress=lambda *args: None,
     output.parent.mkdir(parents=True, exist_ok=True)
     cache_path = output.with_suffix(".cache.json")
     audit_path = output.with_suffix(".audit.json")
+    partial_path = output.with_name(output.stem + '.partial.xlsx')
     cache = {}
     if resume and cache_path.exists():
         try:
@@ -414,14 +458,23 @@ def run(root: Path, output: Path, options: Options, progress=lambda *args: None,
             pass
     results = []
     model_stats = [(p.name, p.stat().st_size, p.stat().st_mtime_ns) for p in Path(options.models).glob("*.traineddata")]
+    model_hashes = [(p.name, hashlib.sha256(p.read_bytes()).hexdigest())
+                    for p in sorted(Path(options.models).glob('*.traineddata'))]
     cancelled = False
     scan_options = asdict(options)
     scan_options.pop('online_titles',None)
     scan_options.pop('workers',None)  # Parallelism must not invalidate unchanged OCR results.
     scan_options.pop('isbn_filter',None)
     scan_options.pop('fast_isbn_folders',None)  # Discovery scope does not change book analysis.
+    legacy_options = dict(scan_options)
+    scan_options.pop('models', None)  # Packaged EXEs unpack to a different temp path each launch.
+    def legacy_fingerprint_for(book):
+        identity = {"version": 10, "options": legacy_options, "models": model_stats,
+                    "notes": book.notes,
+                    "files": [(str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in book.files]}
+        return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
     def fingerprint_for(book):
-        identity = {"version": 10, "options": scan_options, "models": model_stats,
+        identity = {"version": 10, "options": scan_options, "model_hashes": model_hashes,
                     "notes": book.notes,
                     "files": [(str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in book.files]}
         return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
@@ -444,82 +497,123 @@ def run(root: Path, output: Path, options: Options, progress=lambda *args: None,
                 if not result['title'].endswith(suffix):
                     result = {**result, 'title': result['title'] + suffix}
             results.append(result)
+            # Save an atomic, separately named partial workbook after every row.
+            # An open partial workbook must not stop the scan or replace the
+            # requested final workbook before completion.
+            try:
+                export_workbook(partial_path, results, run_status='PARTIAL - IN PROGRESS')
+            except OSError as exc:
+                progress(len(results), len(books), 'Partial Excel could not be updated: ' + str(exc))
             if on_book_complete is not None:
                 on_book_complete(result)
             progress(len(results), len(books), "Completed " + book.files[0].name)
         except InterruptedError:
             return
 
-    if options.workers == 1:
-        for book in books:
+    ctx = multiprocessing.get_context('spawn')
+    shared_stop = ctx.Event()
+    pending = {}
+    iterator = iter(books)
+    exhausted = False
+    cancel_started = None
+    try:
+        while pending or not exhausted:
             if stop.is_set():
-                break
-            fingerprint = fingerprint_for(book)
-            progress(len(results),len(books),'Analysing '+book.files[0].name)
-            try:
-                cached = fingerprint in cache
-                result = cache[fingerprint] if cached else analyse_book(book,options,stop.is_set,
-                    lambda message:progress(len(results),len(books),message))
-                complete(book,fingerprint,result,cached)
-            except InterruptedError:
-                break
-    else:
-        ctx = multiprocessing.get_context('spawn')
-        shared_stop,messages = ctx.Event(),ctx.Queue()
-        executor = None
-        pending = {}
-        iterator = iter(enumerate(books))
-        exhausted = False
-        try:
-            while pending or not exhausted:
+                shared_stop.set()
+                exhausted = True
+                cancel_started = cancel_started or time.monotonic()
+            while not exhausted and len(pending) < options.workers:
                 if stop.is_set():
-                    shared_stop.set()
+                    break
+                try:
+                    book = next(iterator)
+                except StopIteration:
                     exhausted = True
-                # Keep only the selected number of books in flight, so cancel
-                # does not leave a large queued backlog.
-                while not exhausted and len(pending) < options.workers:
-                    try:
-                        index,book = next(iterator)
-                    except StopIteration:
-                        exhausted = True
-                        break
-                    fingerprint = fingerprint_for(book)
-                    if fingerprint in cache:
-                        complete(book,fingerprint,cache[fingerprint],True)
-                        if stop.is_set():
-                            exhausted = True
-                            shared_stop.set()
-                            break
-                        continue
-                    if executor is None:
-                        executor = ProcessPoolExecutor(max_workers=options.workers,mp_context=ctx,
-                            initializer=initialize_worker,initargs=(shared_stop,messages))
-                    progress(len(results),len(books),'Processing in parallel: '+book.files[0].name)
-                    future = executor.submit(process_book,index,book,options)
-                    pending[future] = (book,fingerprint)
-                if not pending:
+                    break
+                fingerprint = fingerprint_for(book)
+                if fingerprint not in cache:
+                    legacy = legacy_fingerprint_for(book)
+                    if legacy in cache:
+                        cache[fingerprint] = cache[legacy]
+                        atomic_json(cache_path, cache)
+                if fingerprint in cache:
+                    complete(book, fingerprint, cache[fingerprint], True)
                     continue
-                finished,_ = wait(pending,timeout=.1,return_when=FIRST_COMPLETED)
-                latest = None
-                while True:
+                # Plain TXT files do not touch the PDF/OCR libraries. Keep their
+                # single-worker path lightweight; all PDFs/images are isolated.
+                if options.workers == 1 and all(p.suffix.lower() == '.txt' for p in book.files):
                     try:
-                        _,latest = messages.get_nowait()
-                    except Empty:
-                        break
-                if latest and not stop.is_set():
-                    progress(len(results),len(books),f'{options.workers}-book parallel · '+latest)
-                for future in finished:
-                    book,fingerprint = pending.pop(future)
-                    try:
-                        complete(book,fingerprint,future.result())
+                        result = analyse_book(book, options, stop.is_set,
+                            lambda message: progress(len(results), len(books), message))
                     except InterruptedError:
-                        pass
-        finally:
-            shared_stop.set()
-            if executor is not None:
-                executor.shutdown(wait=True,cancel_futures=True)
-            messages.close()
-            messages.join_thread()
+                        stop.set()
+                        break
+                    except Exception as exc:
+                        result = failed_book(book, str(exc))
+                    complete(book, fingerprint, result)
+                    continue
+                progress(len(results), len(books), 'Processing safely: ' + book.files[0].name)
+                reader, writer = ctx.Pipe(duplex=False)
+                process = ctx.Process(target=isolated_book_worker,
+                    args=(book, options, shared_stop, writer), name='EPDFBookWorker')
+                try:
+                    process.start()
+                except Exception as exc:
+                    writer.close()
+                    close_worker(process, reader)
+                    complete(book, fingerprint, failed_book(book, 'Worker could not start: ' + str(exc)))
+                    continue
+                writer.close()
+                pending[process] = dict(book=book, fingerprint=fingerprint, reader=reader,
+                    last_activity=time.monotonic(), latest=book.files[0].name, eof=False)
+            for process, task in list(pending.items()):
+                reader = task['reader']
+                result = None
+                terminal = False
+                while worker_has_message(task):
+                    try:
+                        kind, value = reader.recv()
+                    except (EOFError, OSError):
+                        task['eof'] = True
+                        break
+                    task['last_activity'] = time.monotonic()
+                    if kind == 'progress':
+                        task['latest'] = value
+                        if not stop.is_set():
+                            progress(len(results), len(books), value)
+                    elif kind == 'result':
+                        result, terminal = value, True
+                        break
+                    elif kind == 'error':
+                        result, terminal = failed_book(task['book'], value), True
+                        break
+                    elif kind == 'cancelled':
+                        terminal = True
+                        break
+                if not terminal and not process.is_alive():
+                    if worker_has_message(task):
+                        continue  # Drain a result sent between poll() and exit.
+                    # A native access violation bypasses Python exceptions.
+                    code = process.exitcode
+                    detail = f'Worker exited without a result: {code} (0x{(code or 0) & 0xffffffff:08X})'
+                    result = failed_book(task['book'], detail + '; last activity: ' + task['latest'])
+                    terminal = True
+                if not terminal and not stop.is_set() and time.monotonic() - task['last_activity'] > WORKER_STALL_SECONDS:
+                    result = failed_book(task['book'], f'No page progress for {WORKER_STALL_SECONDS} seconds; last activity: ' + task['latest'])
+                    terminal = True
+                if stop.is_set() and cancel_started is not None and time.monotonic() - cancel_started > CANCEL_GRACE_SECONDS:
+                    terminal = True
+                if terminal:
+                    close_worker(process, reader)
+                    del pending[process]
+                    if result is not None and not stop.is_set():
+                        complete(task['book'], task['fingerprint'], result)
+            if pending:
+                time.sleep(.05)
+    finally:
+        shared_stop.set()
+        for process, task in pending.items():
+            close_worker(process, task['reader'])
     cancelled = stop.is_set()
     for isbn in missing_isbns:
         row={'isbn':isbn,'title':'NOT FOUND','language':'N/A','book_type':'N/A','page_count':'N/A','image_count':'N/A',
@@ -533,6 +627,11 @@ def run(root: Path, output: Path, options: Options, progress=lambda *args: None,
                              "not_found_isbns":missing_isbns,
                              "completed": len(results), "total": len(books), "books": results})
     export_workbook(output, results, cancelled)
+    try:
+        export_workbook(partial_path, results, cancelled,
+                        run_status='PARTIAL - CANCELLED' if cancelled else 'COMPLETE')
+    except OSError:
+        pass
     return results, cancelled
 
 
